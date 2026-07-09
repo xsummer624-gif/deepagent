@@ -10,5 +10,3 @@ model = init_chat_model(
     base_url=os.getenv("DEEPSEEK_BASE_URL"),
     api_key=os.getenv("DEEPSEEK_API_KEY")
 )
-res = model.invoke("hello")
-print(res)

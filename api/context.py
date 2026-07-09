@@ -41,14 +41,14 @@ def get_thread_context() -> Optional[str]:
     return _thread_id_ctx.get()
 
 
-def reset_session_context(session_token, thread_token=None):
-    """
-    清理/重置上下文。
-    通常在请求处理结束 (finally 块) 中调用，防止内存泄漏或污染后续请求。
-    """
+def reset_session_context(session_token):
+    """清理会话目录上下文"""
     _session_dir_ctx.reset(session_token)
-    if thread_token:
-        _thread_id_ctx.reset(thread_token)
+
+
+def reset_thread_context(thread_token):
+    """清理线程 ID 上下文"""
+    _thread_id_ctx.reset(thread_token)
 
 
 if __name__ == "__main__":

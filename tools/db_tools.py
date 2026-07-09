@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 from api.monitor import monitor
 from mysql.connector import connect, Error
@@ -8,7 +9,6 @@ from langchain_core.tools import tool
 load_dotenv()
 
 
-# 加载配置文件方便后续使用
 def get_db_config():
     """Get database configuration from environment variables."""
     config = {
@@ -22,10 +22,8 @@ def get_db_config():
         "autocommit": True,
         "sql_mode": os.getenv("MYSQL_SQL_MODE", "TRADITIONAL")
     }
-    # 移除 None 值（核心必要操作）
     config = {k: v for k, v in config.items() if v is not None}
 
-    # 补充：校验核心配置是否存在（可选但推荐）
     required_keys = ["user", "password", "database"]
     missing_keys = [k for k in required_keys if k not in config]
     if missing_keys:
@@ -33,169 +31,92 @@ def get_db_config():
 
     return config
 
+
+def _execute_query(sql: str, description: str = "") -> str:
+    """执行SQL查询并以CSV格式返回结果"""
+    config = get_db_config()
+    try:
+        with connect(**config) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                desc = cursor.description
+                if not desc:
+                    return f"查询没有结果，sql为: {sql}" if description else f"{description}"
+                columns = [col[0] for col in desc]
+                rows = cursor.fetchall()
+                results = [",".join(map(str, row)) for row in rows]
+                return f"{','.join(columns)}\n{'\n'.join(results)}"
+    except Error as e:
+        return f"查询出现异常: {str(e)}"
+
+
 @tool
 def list_sql_tables() -> str:
     """
     列出配置的 MySQL 数据库中所有可用的表。
-    核心用途：
-        AI Agent 需要查看数据库中有哪些表时调用，为后续执行 SQL 查询提供基础信息。
     返回值：
         str: 成功时返回 "可用数据表：表1, 表2, ..."；
-             配置缺失时返回错误提示；
-             执行异常时返回具体错误信息。
-    异常处理：
-        捕获数据库连接/执行 SQL 时的所有 Error 异常，返回可读的错误信息，避免 Agent 崩溃。
+              配置缺失时返回错误提示；
+              执行异常时返回具体错误信息。
     """
-    # 埋点监控：记录工具调用行为（便于分析工具使用频率）
-    monitor.report_tool(tool_name="数据库表获取工具",args={})
-    # 获取数据库配置
-    config = get_db_config()
-    # 1. 创建一个链接
-    # 2. 创建cursor
-    # 3. cursor执行sql语句
-    # 4. cursor获取返回结果
-    # 5. 释放连接和cursor资源
-    # 6. 确保要捕捉异常信息, 返回异常提示, 避免直接报错!
-    try:
-        # 确保资源使用完毕一定释放 with
-        with connect(**config) as conn:
-            with conn.cursor() as cursor:
-                sql = "show tables"
-                cursor.execute(sql)
-                # 捕捉执行结果 要所有的表名称
-                # [(表1),(表2),(表3)]
-                tables = cursor.fetchall()
-                if not tables:
-                    return "没有可用的表"
-                # 可用的表有: 表1, 表2, 表3...
-                # [表1, 表2, 表3]
-                table_names = [table[0] for table in tables]
-                return f"可用的表有: {', '.join(table_names)}"
-    except Error as e:
-        return f"查询出现异常: {str(e)}"
+    monitor.report_tool(tool_name="数据库表获取工具", args={})
+    result = _execute_query("show tables")
+    if "查询出现异常" in result or "查询没有结果" in result:
+        return result
+    # 解析CSV格式的返回，提取表名
+    lines = result.strip().split("\n")
+    if len(lines) < 2:
+        return "没有可用的表"
+    table_names = [line.strip() for line in lines[1:] if line.strip()]
+    return f"可用的表有: {', '.join(table_names)}" if table_names else "没有可用的表"
+
+
+def _validate_table_name(table_name: str) -> bool:
+    """验证表名是否合法（仅允许字母、数字、下划线）"""
+    return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name))
+
 
 @tool
-def get_table_data(table_name:str)->str:
+def get_table_data(table_name: str) -> str:
     """
-    查询指定表名的数据!当前工具调用之前,必须先调用list_sql_tables完成表名的校验!
-    此工具的作用:1.可以完成单表数据的查询 2.可以为多表查询提供表结果信息(列名&数据格式)
-    :param table_name: 表名
-    :return: csv格式的数据(模拟表格数据格式)
-    1.第一行是列信息,列之间使用,(英文的逗号)分割
-    2.第二行开始是表数据,值之间也使用,(英文的逗号)分割
-    3.行和行之间使用\n分割
-    4.至多表数据查询100条
-    例如:
-        id,name,age\n -> 列头
-        1,张三,18\n
-        1,张三,18\n -> 至多查询100条
-        1,张三,18\n
-        1,张三,18\n
+    查询指定表名的数据。调用前必须先调用 list_sql_tables 完成表名校验。
+    返回 CSV 格式数据（含列头），至多 100 条。
     """
-    # 埋点,调用工具了告诉前端哪个工具被调用了!!
-    monitor.report_tool_call(tool_name="数据库表数据查询工具: get_table_data", args={"table_name":table_name})
-    # 获取数据库参数
-    config = get_db_config()
-    # 1. 创建一个链接
-    # 2. 创建cursor
-    # 3. cursor执行sql语句
-    # 4. cursor获取返回结果
-    # 5. 释放连接和cursor资源
-    # 确保要捕捉异常信息, 返回异常提示, 避免直接报错!
-    try:
-        # 1. 创建一个链接
-        with connect(**config) as conn:
-            # 2. 创建cursor
-            with conn.cursor() as cursor:
-                # 3. cursor执行sql语句
-                sql = f"select * from {table_name} limit 100"
-                cursor.execute(sql)
-                # 4. cursor获取返回结果
-                # 4.1 获取列的信息
-                # 返回的查询结果的列的信息
-                # description => [(id,列长度...),( ),( )]
-                # 如果查询没有结果 -》 description 也是None
-                description = cursor.description
-                if not description:
-                    return f"数据表: {table_name}为空没有数据! "
-                # 4.2 获取查询结果
-                # description => [(id,列长度...),(date,....),( )] => 元组 index = 0 列名
-                # [列1,列2,列3...]
-                columns = [desc[0] for desc in description]  # [1,2,3,4]
-                # 表数据
-                # [(1,张三),(2,李四),(3,二狗子)]
-                rows = cursor.fetchall()
-                # (1,张三) -> ('1','张三') -> '1,张三'
-                # ['1,张三','1,张三','1,张三','1,张三','1,张三']
-                results = [",".join(map(str, row)) for row in rows]
-                # columns -> csv -> header
-                # id,name,age
-                header_str = ",".join(columns)
-                # '1,张三'\n
-                data_str = "\n".join(results)
-                return f"{header_str}\n{data_str}"
-    except Error as e:
-        return f"查询出现异常: {str(e)}"
+    monitor.report_tool(tool_name="数据库表数据查询工具: get_table_data", args={"table_name": table_name})
+
+    if not _validate_table_name(table_name):
+        return f"错误：非法的表名 '{table_name}'"
+
+    result = _execute_query(f"select * from {table_name} limit 100")
+    if "查询出现异常" in result:
+        return result
+    lines = result.strip().split("\n")
+    if len(lines) < 2:
+        return f"数据表: {table_name} 为空没有数据!"
+    return result
+
 
 @tool
-def execute_sql_query(query:str)->str:
+def execute_sql_query(query: str) -> str:
     """
-    执行自定义查询语句 切记：执行之前，需要通过执行 list_sql_tables明确表名！执行get_table_data
-    明确表结构和数据格式
-    :param table_name: 表名
-    :return: csv格式的数据(模拟表格数据格式)
-    1.第一行是列信息,列之间使用,(英文的逗号)分割
-    2.第二行开始是表数据,值之间也使用,(英文的逗号)分割
-    3.行和行之间使用\n分割
-    4.至多表数据查询100条
-    例如:
-        id,name,age\n -> 列头
-        1,张三,18\n
-        1,张三,18\n -> 至多查询100条
-        1,张三,18\n
-        1,张三,18\n
+    执行自定义查询语句。仅允许 SELECT 查询。
+    执行前需通过 list_sql_tables 明确表名，通过 get_table_data 明确表结构和数据格式。
+    返回 CSV 格式数据，至多 100 条。
     """
-    # 埋点,调用工具了告诉前端哪个工具被调用了!!
-    monitor.report_tool_call(tool_name="数据库表数据查询工具: execute_sql_query", args={"query":query})
-    # 获取数据库参数
-    config = get_db_config()
-    # 1. 创建一个链接
-    # 2. 创建cursor
-    # 3. cursor执行sql语句
-    # 4. cursor获取返回结果
-    # 5. 释放连接和cursor资源
-    # 确保要捕捉异常信息, 返回异常提示, 避免直接报错!
-    try:
-        # 1. 创建一个链接
-        with connect(**config) as conn:
-            # 2. 创建cursor
-            with conn.cursor() as cursor:
-                # 3. cursor执行sql语句
-                cursor.execute(query)
-                # 4. cursor获取返回结果
-                # 4.1 获取列的信息
-                # 返回的查询结果的列的信息
-                # description => [(id,列长度...),( ),( )]
-                # 如果查询没有结果 -》 description 也是None
-                description = cursor.description
-                if not description:
-                    return f"执行自定义查询SQL语句查询没有结果，sql为: {query} "
-                # 4.2 获取查询结果
-                # description => [(id,列长度...),(date,....),( )] => 元组 index = 0 列名
-                # [列1,列2,列3...]
-                columns = [desc[0] for desc in description]  # [1,2,3,4]
-                # 表数据
-                # [(1,张三),(2,李四),(3,二狗子)]
-                rows = cursor.fetchall()
-                # (1,张三) -> ('1','张三') -> '1,张三'
-                # ['1,张三','1,张三','1,张三','1,张三','1,张三']
-                results = [",".join(map(str, row)) for row in rows]
-                # columns -> csv -> header
-                # id,name,age
-                header_str = ",".join(columns)
-                # '1,张三'\n
-                data_str = "\n".join(results)
-                return f"{header_str}\n{data_str}"
-    except Error as e:
-        return f"查询出现异常: {str(e)}"
+    monitor.report_tool(tool_name="数据库表数据查询工具: execute_sql_query", args={"query": query})
+
+    stripped = query.strip().upper()
+    if not stripped.startswith("SELECT"):
+        return f"错误：仅允许 SELECT 查询，当前语句以 '{stripped.split()[0] if stripped else ''}' 开头"
+
+    if "INTO OUTFILE" in stripped or "INTO DUMPFILE" in stripped:
+        return "错误：禁止使用文件写入操作"
+
+    result = _execute_query(query)
+    if "查询出现异常" in result:
+        return result
+    lines = result.strip().split("\n")
+    if len(lines) < 2:
+        return f"执行自定义查询SQL语句查询没有结果，sql为: {query}"
+    return result
 

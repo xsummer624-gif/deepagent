@@ -49,47 +49,30 @@ class ToolMonitor:
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-        # 1. 优先尝试通过 FastAPI WebSocket 发送 (定向推送)
         if self.websocket_manager:
             try:
-                # 获取当前线程 ID
                 thread_id = get_thread_context()
+                manager_loop = self.websocket_manager.loop
 
-                # 确保 loop 已加载
-                manager_loop = self.websocket_manager.get_loop()
-
-                if manager_loop:
-                    if thread_id:
-                        # 检查当前是否在同一个事件循环中
-                        try:
-                            current_loop = asyncio.get_running_loop()
-                        except RuntimeError:
-                            current_loop = None
-
-                        if current_loop and current_loop == manager_loop:
-                            # 如果在同一个循环中（例如在 create_task 中运行），直接创建任务
-                            current_loop.create_task(
-                                self.websocket_manager.send_to_thread(payload, thread_id)
-                            )
-                        else:
-                            # 如果在不同线程，使用 threadsafe 方法
-                            asyncio.run_coroutine_threadsafe(
-                                self.websocket_manager.send_to_thread(payload, thread_id),
-                                manager_loop
-                            )
+                if manager_loop and thread_id:
+                    current_loop = asyncio.get_running_loop()
+                    if current_loop == manager_loop:
+                        current_loop.create_task(
+                            self.websocket_manager.send_to_thread(payload, thread_id)
+                        )
                     else:
-                        # 如果没有 thread_id，说明可能是系统级消息，或者未上下文环境
-                        pass
+                        asyncio.run_coroutine_threadsafe(
+                            self.websocket_manager.send_to_thread(payload, thread_id),
+                            manager_loop
+                        )
             except Exception as e:
                 print(f"[Monitor] WebSocket send failed: {e}")
 
-        # 2. 尝试通过全局 runtime 输出 (DeepAgents 脚本模式)
-        # 这使得 simple_agents.py 中的 MockRuntime 能接收到数据
         if builtins and hasattr(builtins, 'runtime') and hasattr(builtins.runtime, 'stream_writer'):
             try:
                 builtins.runtime.stream_writer(payload)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Monitor] Runtime stream writer failed: {e}")
 
         # 3. 控制台保底输出 (方便调试)
         # 加上特殊前缀，方便肉眼识别
@@ -120,40 +103,22 @@ monitor = ToolMonitor()
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        # 延迟绑定 loop，防止初始化时 loop 不一致
         self.loop = None
 
-    def get_loop(self):
-        """懒加载获取当前运行的事件循环"""
-        if self.loop is None:
-            try:
-                self.loop = asyncio.get_running_loop()
-                # 同时设置 monitor 的 manager (确保双向绑定)
-                monitor.set_websocket_manager(self)
-                print(f"[Monitor] ConnectionManager auto-bound to loop: {id(self.loop)}")
-            except RuntimeError:
-                print("[Monitor] Warning: No running event loop found yet.")
-        return self.loop
+    def set_loop(self, loop):
+        self.loop = loop
+        monitor.set_websocket_manager(self)
 
     async def connect(self, websocket: WebSocket, thread_id: str):
-        # 每次连接时尝试获取/更新 loop
-        self.get_loop()
-
         await websocket.accept()
         self.active_connections[thread_id] = websocket
-        print(f"Client connected: {thread_id}")
 
     def disconnect(self, websocket: WebSocket, thread_id: str):
-        if thread_id in self.active_connections:
-            del self.active_connections[thread_id]
-        print(f"Client disconnected: {thread_id}")
-
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
+        self.active_connections.pop(thread_id, None)
 
     async def send_to_thread(self, message: dict, thread_id: str):
-        if thread_id in self.active_connections:
-            websocket = self.active_connections[thread_id]
+        websocket = self.active_connections.get(thread_id)
+        if websocket:
             await websocket.send_json(message)
 
 

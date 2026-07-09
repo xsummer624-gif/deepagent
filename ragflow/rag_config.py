@@ -9,7 +9,8 @@ def _load_ragflow_env() -> Tuple[Optional[str], Optional[str]]:
     """
     # 优先加载项目根目录的 .env 文件
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(current_dir, ".env")
+    project_root = os.path.dirname(current_dir)
+    env_path = os.path.join(project_root, ".env")
     if os.path.exists(env_path):
         load_dotenv(env_path)
     else:

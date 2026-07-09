@@ -30,11 +30,16 @@ models/
 *.pdf
 *.zip
 *.tar.gz
+*.tar
+ragflow/usage/镜像资料/*.zip
 
 # ===== 依赖锁定文件 =====
 uv.lock
 poetry.lock
 Pipfile.lock
+
+# ===== 前端 =====
+frontend/node_modules/
 
 # ===== 其他 =====
 .DS_Store

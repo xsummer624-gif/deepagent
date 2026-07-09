@@ -18,7 +18,7 @@ from api.monitor import monitor
 load_dotenv()
 
 # 定义一个TavilyClient对象
-tavily_cline = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 @tool
 def internet_search(
@@ -41,5 +41,5 @@ def internet_search(
     monitor.report_tool(tool_name="网络搜索工具",args={"query":query, "topic":topic,
                                "max_results":max_results,"include_raw_content":include_raw_content})
 
-    return tavily_cline.search(query=query, topic=topic,
+    return tavily_client.search(query=query, topic=topic,
                                max_results=max_results,include_raw_content=include_raw_content)

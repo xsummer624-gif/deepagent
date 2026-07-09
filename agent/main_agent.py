@@ -4,11 +4,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agent.subagents.knowledge_base_agent import knowledge_base_agent
 from agent.subagents.database_query_agent import database_query_agent
 from agent.subagents.network_search_agent import network_search_agent
-from tools import markdown_tools, pdf_tools, upload_file_read_tool
+from tools import markdown_tools, upload_file_read_tool
 
 # 工具
 from tools.markdown_tools import generate_markdown
-from tools.pdf_tools import convert_md_to_pdf
 from tools.upload_file_read_tool import read_file_content
 
 from deepagents import create_deep_agent
@@ -22,11 +21,10 @@ import uuid
 import shutil
 from pathlib import Path
 
-from api.context import set_session_context, reset_session_context, set_thread_context
+from api.context import set_session_context, reset_session_context, set_thread_context, reset_thread_context
+from api.logger import AgentLogger, AgentLogCallbackHandler
 
 from langchain_core.messages import AIMessage
-
-from 资料.api.server import project_root
 
 subagents_list = [
     knowledge_base_agent,
@@ -37,7 +35,7 @@ main_agent = create_deep_agent(
     model=model,
     subagents=subagents_list,
     system_prompt=main_agent_content['system_prompt'],
-    tools=[generate_markdown,convert_md_to_pdf,read_file_content],
+    tools=[generate_markdown,read_file_content],
     checkpointer=InMemorySaver()
 )
 
@@ -51,7 +49,7 @@ main_agent = create_deep_agent(
                                    开启调用以后 -》当前会话 -》文件夹地址 -》推送到前端
 """
 # 获取绝对地址 解析路径标识以及软连接
-project_root_path = Path(__file__).parents[1].resolve()
+project_root = Path(__file__).parents[1].resolve()
 
 
 def _prepare_session_environment(thread_id: str):
@@ -174,9 +172,14 @@ async def run_deep_agent(task_query: str, thread_id: str = None):
     # 给前端推送文件夹，方便后续查询当前会话对应文件夹下的所有文件
     monitor.report_session_dir(session_dir_str)
 
+    # 初始化日志记录器
+    agent_logger = AgentLogger(thread_id, str(project_root))
+    log_callback = AgentLogCallbackHandler(agent_logger)
+
     # 4. [运行时配置] LangChain Config (注入记忆 key)
     config = {
         "configurable": {"thread_id": thread_id},  # 用于 MemorySaver 记忆上下文
+        "callbacks": [log_callback],
     }
     # 5. [提示词构建] 动态注入环境约束
     path_instruction = f"""
@@ -206,6 +209,5 @@ async def run_deep_agent(task_query: str, thread_id: str = None):
         monitor._emit("error", f"Execution failed: {e}")
         return f"Error: {e}"
     finally:
-        # 8. [资源清理] 必须重置 ContextVars，防止线程池复用导致的上下文污染
-        if 'session_token' in locals():
-            reset_session_context(session_token, thread_token)
+        reset_session_context(session_token)
+        reset_thread_context(thread_token)

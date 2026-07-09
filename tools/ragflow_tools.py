@@ -1,44 +1,15 @@
 # get_assistant_list 获取聊天助手和知识库信息
 # create_ask_delete 创建提问和删除会话获取rag查询结果
 # 导入系统核心模块
-import os
 import logging
-# 导入自定义监控模块（用于上报工具调用日志）
 from api.monitor import monitor
-# 导入HTTP请求库（用于健康检查）
-import requests
-# 导入RAGFlow SDK核心类（用于操作RAGFlow助手/知识库）
 from ragflow_sdk import RAGFlow
-# 导入环境变量加载工具（用于读取.env文件中的配置）
-from dotenv import load_dotenv
-# 导入LangChain工具装饰器（用于将函数注册为Agent可调用的工具）
 from langchain_core.tools import tool
 from typing_extensions import Annotated
-
-# 初始化日志器（用于记录工具运行日志）
-logger = logging.getLogger(__name__)
-
-# 导入类型注解（用于函数返回值/参数类型约束）
 from typing import Tuple, Optional
+from ragflow.rag_config import _load_ragflow_env
 
-
-def _load_ragflow_env() -> Tuple[Optional[str], Optional[str]]:
-    """
-    加载RAGFlow的环境变量（API密钥和服务地址）
-    优先加载当前脚本目录下的.env文件，若不存在则加载系统环境变量
-
-    Returns:
-        Tuple[Optional[str], Optional[str]]:
-            - 第一个值：RAGFlow API密钥（RAGFLOW_API_KEY）
-            - 第二个值：RAGFlow服务地址（RAGFLOW_API_URL）
-            - 若未配置则返回None
-    """
-    load_dotenv()
-
-    # 从环境变量中读取配置
-    api_key = os.getenv("RAGFLOW_API_KEY")
-    base_url = os.getenv("RAGFLOW_API_URL")
-    return api_key, base_url
+logger = logging.getLogger(__name__)
 
 
 @tool
@@ -121,7 +92,7 @@ def create_ask_delete(
             full_answer = ""
             for part in response_generator:
                 if hasattr(part, "content") and part.content:
-                    full_answer = part.content  # 覆盖更新为完整答案（流式最后一段是完整内容）
+                    full_answer += part.content
 
             # 埋点监控：记录返回的答案
             monitor.report_tool(

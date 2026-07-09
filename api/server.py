@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, F
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict
 import shutil
 
 # Add project root to sys.path
@@ -23,6 +23,9 @@ from api.monitor import monitor, manager
 
 app = FastAPI(title="DeepAgents API")
 
+# 跟踪运行中的任务，用于取消和状态查询
+_running_tasks: Dict[str, asyncio.Task] = {}
+
 # 挂载输出目录，以便前端访问生成的静态文件
 # 假设输出目录位于项目根目录下的 output
 output_dir = project_root / "output"
@@ -36,11 +39,16 @@ updated_dir.mkdir(exist_ok=True)
 # 配置 CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:5173", "http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    manager.set_loop(asyncio.get_running_loop())
+
 
 class TaskRequest(BaseModel):
     query: str
@@ -69,8 +77,11 @@ async def run_task(request: TaskRequest):
     thread_id = request.thread_id or str(uuid.uuid4())
 
     # 2. [后台执行] 异步运行 Agent，不阻塞主线程
-    # 注意：这里简单的使用 asyncio.create_task 触发，由 main_agent 内部负责实时推送
-    asyncio.create_task(run_deep_agent(request.query, thread_id))
+    task = asyncio.create_task(run_deep_agent(request.query, thread_id))
+    _running_tasks[thread_id] = task
+
+    # 任务完成后自动清理
+    task.add_done_callback(lambda t: _running_tasks.pop(thread_id, None))
 
     # 3. [立即响应]
     return {"status": "started", "thread_id": thread_id}

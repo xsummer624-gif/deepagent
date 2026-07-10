@@ -113,7 +113,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/your-username/deep-search.git
+git clone https://github.com/xsummer624/deepagent.git
 cd deep-search
 ```
 

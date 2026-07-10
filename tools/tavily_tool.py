@@ -1,45 +1,45 @@
-# ======================== 导入核心依赖 ========================
-# 类型注解：增强代码提示和静态检查能力
-from typing import  Literal
-# LangChain 工具装饰器：将普通函数转为 Agent 可调用的工具
+from typing import Literal
 from langchain_core.tools import tool
-# Tavily 官方客户端：实现网络搜索核心功能
 from tavily import TavilyClient
-
-# 系统/第三方依赖
-import os  # 系统路径/环境变量处理
-from dotenv import load_dotenv  # 加载 .env 文件中的环境变量
-
-# 自定义模块：工具调用埋点监控（需确保 api 模块可导入）
+import os
+from dotenv import load_dotenv
 from api.monitor import monitor
 
-# ======================== 初始化配置 ========================
-# 加载项目根目录的 .env 文件，读取环境变量（如 TAVILY_API_KEY）
 load_dotenv()
 
-# 定义一个TavilyClient对象
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+# 延迟创建：避免模块导入时即初始化客户端（Key 缺失时报错时机后移到首次调用）
+_tavily_client: TavilyClient | None = None
+
+
+def _get_tavily_client() -> TavilyClient:
+    global _tavily_client
+    if _tavily_client is None:
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            raise ValueError("TAVILY_API_KEY 未配置，请在 .env 中设置")
+        _tavily_client = TavilyClient(api_key=api_key)
+    return _tavily_client
+
 
 @tool
 def internet_search(
         query: str,
-        topic: Literal["news","finance","general"] = "general",
+        topic: Literal["news", "finance", "general"] = "general",
         max_results: int = 5,
         include_raw_content: bool = False
 ):
     """
-    根据用户问题，进行网络信息收集
+    根据用户问题，进行网络信息收集。
     注意：主要搜集网络公开信息，如果指定查询数据库或者rag不要使用此工具
     :param query: 用户的查询信息
     :param topic: 查询类型
     :param max_results: 返回的最大条数
     :param include_raw_content: 是否返回原内容 False 精简 True 详细
-    :return: 
+    :return:
     """
-    # 每次调用工具都会向前端推送调用进度
-    # 1.工具名字 2.调用工具参数信息
-    monitor.report_tool(tool_name="网络搜索工具",args={"query":query, "topic":topic,
-                               "max_results":max_results,"include_raw_content":include_raw_content})
+    monitor.report_tool(tool_name="网络搜索工具", args={"query": query, "topic": topic,
+                               "max_results": max_results, "include_raw_content": include_raw_content})
 
-    return tavily_client.search(query=query, topic=topic,
-                               max_results=max_results,include_raw_content=include_raw_content)
+    client = _get_tavily_client()
+    return client.search(query=query, topic=topic,
+                         max_results=max_results, include_raw_content=include_raw_content)

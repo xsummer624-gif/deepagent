@@ -18,8 +18,10 @@ __pycache__/
 
 # ===== 输出和临时文件 =====
 output/
+updated/
 temp/
 cache/
+log/
 logs/
 *.log
 

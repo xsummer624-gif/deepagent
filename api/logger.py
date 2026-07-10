@@ -1,10 +1,12 @@
 import os
 import datetime
 import json
-import logging
+import logging as std_logging
 from typing import Any, Dict, List, Optional
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
+
+_logger = std_logging.getLogger(__name__)
 
 
 class AgentLogger:
@@ -35,7 +37,7 @@ class AgentLogger:
             if not os.path.exists(self.log_dir):
                 os.makedirs(self.log_dir)
         except Exception as e:
-            print(f"[AgentLogger] Warning: Failed to create log directory: {e}")
+            _logger.warning(f"Failed to create log directory: {e}")
 
     def _setup_logger(self) -> logging.Logger:
         logger_name = f"agent_trace_{self.thread_id}"
@@ -55,7 +57,7 @@ class AgentLogger:
 
                 logger.addHandler(file_handler)
             except Exception as e:
-                print(f"[AgentLogger] Error setting up logger: {e}")
+                _logger.warning(f"Error setting up logger: {e}")
 
         return logger
 

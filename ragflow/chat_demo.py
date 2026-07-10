@@ -44,9 +44,9 @@ def ask_question(chat_name,question):
     #流的每一部分的对象 part
     for part in response:
         #数据存在对象中content
-        result = part.content
+        result += part.content
     #5.关闭提问会话
-    use_chat.delete_session(ids=[session.id])
+    use_chat.delete_sessions(ids=[session.id])
     #6.返回结果
     return result
 if __name__ == '__main__':

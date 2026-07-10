@@ -1,17 +1,14 @@
-# 子智能体
+import logging
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.subagents.knowledge_base_agent import knowledge_base_agent
 from agent.subagents.database_query_agent import database_query_agent
 from agent.subagents.network_search_agent import network_search_agent
-from tools import markdown_tools, upload_file_read_tool
 
-# 工具
 from tools.markdown_tools import generate_markdown
 from tools.upload_file_read_tool import read_file_content
 
 from deepagents import create_deep_agent
-# 描述系统提示词
 from agent.llm import model
 from agent.prompts import main_agent_content
 
@@ -26,28 +23,32 @@ from api.logger import AgentLogger, AgentLogCallbackHandler
 
 from langchain_core.messages import AIMessage
 
+logger = logging.getLogger(__name__)
+
 subagents_list = [
     knowledge_base_agent,
     database_query_agent,
     network_search_agent
 ]
-main_agent = create_deep_agent(
-    model=model,
-    subagents=subagents_list,
-    system_prompt=main_agent_content['system_prompt'],
-    tools=[generate_markdown,read_file_content],
-    checkpointer=InMemorySaver()
-)
 
-"""
-    1.执行主智能体 一定要选择异步 
-    2.什么时候触发我们智能体的调用或者执行？
-    3.客户端 -》api/task -》fastapi接口 -》异步执行 -》main_agent运行
-    4.main_agent执行stream流式处理 -》调用工具 -》已经埋好点了
-                                   调用子智能体 -》结果解析 -》name=task -》monitor -》发送子智能体
-                                   调用最终结果 -》结果 -》monitor -》发送结果的方式
-                                   开启调用以后 -》当前会话 -》文件夹地址 -》推送到前端
-"""
+# 延迟初始化：避免模块导入时即创建 Agent（含 LLM 连接），提升启动速度与可测试性
+_main_agent = None
+
+
+def get_main_agent():
+    """惰性创建并缓存主智能体实例。"""
+    global _main_agent
+    if _main_agent is None:
+        _main_agent = create_deep_agent(
+            model=model,
+            subagents=subagents_list,
+            system_prompt=main_agent_content['system_prompt'],
+            tools=[generate_markdown, read_file_content],
+            checkpointer=InMemorySaver()
+        )
+    return _main_agent
+
+
 # 获取绝对地址 解析路径标识以及软连接
 project_root = Path(__file__).parents[1].resolve()
 
@@ -55,16 +56,6 @@ project_root = Path(__file__).parents[1].resolve()
 def _prepare_session_environment(thread_id: str):
     """
     初始化会话运行环境（会话文件夹,以及相对路径，上传文件的信息！）。
-    目标：
-    1. 创建独立的物理工作空间。
-    2. 处理用户上传的文件。
-    3. 生成供 Agent 和前端使用的路径上下文（提示词）。
-
-    执行步骤：
-    1. 创建绝对路径：`project_root/output/session_{uuid}`。
-    2. 标准化路径：转换为 POSIX 风格 (`/`) 以兼容 LLM 和跨平台。
-    3. 文件迁移：将 `updated/session_{uuid}` 中的文件复制到工作目录。
-    4. 构造提示词：生成包含已上传文件列表的 Context 文本。
 
     Returns:
         tuple: (
@@ -92,96 +83,71 @@ def _prepare_session_environment(thread_id: str):
 
         if files:
             for f in files:
-                # 核心动作：将文件从临时上传区复制到正式工作区
                 shutil.copy2(upload_dir / f, session_dir / f)
 
-            # 5. [构造] 生成文件列表提示词
             uploaded_info = (f"\n    [已上传文件] 已加载到工作目录:\n" +
                              "\n".join([f"    - {f}" for f in files]) +
                              "\n    请优先使用工具读取并参考这些文件。")
 
     return session_dir_str, relative_session_dir, uploaded_info
 
+
 def _process_stream_chunk(chunk):
     """
-    处理 LangGraph 流式输出的增量状态 (Stream Processing)。
-    目标：
-    1. 解析 Agent 的每一步思考和行动。
-    2. 识别关键事件（工具调用、子 Agent 委派、最终回复）。
-    3. 通过 Monitor 实时上报状态给前端。
-    核心逻辑：
-    - 监听 `tool_calls` -> 记录日志，若是 'task' 则上报子 Agent 状态。
-    - 监听 `content` -> 若无工具调用，则视为 Agent 的最终回复。
-    Args:
-        chunk (dict): 增量状态字典，如 {"node_name": {"messages": [AIMessage(...)]}}
+    处理 LangGraph 流式输出的增量状态。
+    - 监听 tool_calls -> 若是 'task' 则上报子 Agent 状态。
+    - 监听 content -> 若无工具调用，则视为 Agent 的最终回复。
     """
-    # 1. [记录] 记录原始数据便于回溯
-    # logger.log_main_chunk(chunk)
-
-    # 2. [遍历] 解析每个节点的输出 (通常是 'agent' 或 'tools' 节点)
     for node_name, state in chunk.items():
-        if not state or "messages" not in state: continue
-        # 3. [提取] 获取最新一条消息 (Latest Message)
+        if not state or "messages" not in state:
+            continue
         messages = state["messages"]
         if isinstance(messages, list) and messages:
             last_msg = messages[-1]
-            # 4. [分支] 处理 AI 消息 (AIMessage)
             if isinstance(last_msg, AIMessage):
-                # Case 1: Agent 决定调用工具 (Tool Call)
                 if last_msg.tool_calls:
                     for tool in last_msg.tool_calls:
-                        # 特殊处理：如果是 'task' 工具，说明正在委派给子 Agent
                         if tool['name'] == 'task':
                             monitor.report_assistant(
                                 tool['args'].get('subagent_type', 'Agent'),
                                 {"desc": tool['args'].get('description')}
                             )
-                # Case 2: Agent 生成最终回复 (Final Answer)
                 elif last_msg.content:
                     monitor.report_task_result(last_msg.content)
+
 
 # ====================== 核心执行逻辑 ======================
 async def run_deep_agent(task_query: str, thread_id: str = None):
     """
-    DeepAgents 核心执行入口 (Agent Execution Runtime)。
-
-    目标：
-    1. 接收用户的自然语言任务。
-    2. 准备独立的运行环境 (Workspace)。
-    3. 启动 LangGraph 智能体，并通过流式 (Stream) 实时处理每一步。
-    4. 确保上下文隔离和异常安全。
+    DeepAgents 核心执行入口。
 
     执行步骤：
-    1. ID 初始化：确保每个任务有唯一的 `thread_id`。
+    1. ID 初始化：确保每个任务有唯一的 thread_id。
     2. 环境准备：创建目录、迁移文件、生成路径信息。
-    3. 上下文绑定：将 `thread_id` 和 `session_dir` 绑定到当前线程 (ContextVar)。
+    3. 上下文绑定：将 thread_id 和 session_dir 绑定到当前协程 (ContextVar)。
     4. 提示词构建：将环境信息注入到 Prompt。
     5. 流式执行：驱动 LangGraph 运行，并实时解析/上报每一个 Chunk。
     6. 资源清理：任务结束后（无论成功失败）重置上下文。
     """
-    # 1. [ID 初始化] 确保有唯一的会话 ID
-    if not thread_id: thread_id = str(uuid.uuid4())
-    print(f"--- Start Task: {task_query} (Thread: {thread_id}) ---")
+    if not thread_id:
+        thread_id = str(uuid.uuid4())
+    logger.info(f"--- Start Task: {task_query} (Thread: {thread_id}) ---")
 
-    # 2. [环境准备] 创建目录、处理上传文件
     session_dir_str, relative_session_dir, uploaded_info = _prepare_session_environment(thread_id)
 
-    # 3. [上下文绑定] 初始化 ContextVars (关键：隔离并发请求)
     thread_token = set_thread_context(thread_id)
     session_token = set_session_context(session_dir_str)
-    # 给前端推送文件夹，方便后续查询当前会话对应文件夹下的所有文件
-    monitor.report_session_dir(session_dir_str)
+    # 推送相对 output 目录的路径，供前端拼接静态文件 URL
+    monitor.report_session_dir(relative_session_dir)
 
-    # 初始化日志记录器
     agent_logger = AgentLogger(thread_id, str(project_root))
     log_callback = AgentLogCallbackHandler(agent_logger)
 
-    # 4. [运行时配置] LangChain Config (注入记忆 key)
     config = {
-        "configurable": {"thread_id": thread_id},  # 用于 MemorySaver 记忆上下文
+        "configurable": {"thread_id": thread_id},
         "callbacks": [log_callback],
     }
-    # 5. [提示词构建] 动态注入环境约束
+
     path_instruction = f"""
     【工作环境指令】
     工作目录: {relative_session_dir}
@@ -193,19 +159,16 @@ async def run_deep_agent(task_query: str, thread_id: str = None):
     3. 若存在上传文件，请先分析内容
     """
 
-    # 6. [流式执行] 启动 Agent 循环
     try:
-        # astream: 异步生成器，像流水线一样逐个吐出 Agent 的思考片段
-        async for chunk in main_agent.astream(
+        agent = get_main_agent()
+        async for chunk in agent.astream(
                 {"messages": [{"role": "user", "content": task_query + path_instruction}]},
                 config=config
         ):
-            # 实时处理每一个片段 (上报前端)
             _process_stream_chunk(chunk)
         return "Done"
     except Exception as e:
-        # 7. [异常处理] 兜底捕获
-        print(f"Error: {e}")
+        logger.exception(f"Execution failed: {e}")
         monitor._emit("error", f"Execution failed: {e}")
         return f"Error: {e}"
     finally:

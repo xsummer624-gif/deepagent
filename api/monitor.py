@@ -1,8 +1,11 @@
 import datetime
 import asyncio
-from typing import Any, Dict, Optional
+import logging
+from typing import Any, Dict, List, Optional
 from fastapi import WebSocket
 from api.context import get_thread_context
+
+logger = logging.getLogger(__name__)
 
 # 尝试导入全局运行时（用于脚本模式下的流式输出）
 try:
@@ -55,28 +58,29 @@ class ToolMonitor:
                 manager_loop = self.websocket_manager.loop
 
                 if manager_loop and thread_id:
-                    current_loop = asyncio.get_running_loop()
-                    if current_loop == manager_loop:
-                        current_loop.create_task(
-                            self.websocket_manager.send_to_thread(payload, thread_id)
-                        )
+                    coro = self.websocket_manager.send_to_thread(payload, thread_id)
+                    try:
+                        current_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        # 当前线程没有运行中的事件循环（如子线程）
+                        current_loop = None
+
+                    if current_loop is not None and current_loop == manager_loop:
+                        # 同一事件循环内，直接调度任务
+                        current_loop.create_task(coro)
                     else:
-                        asyncio.run_coroutine_threadsafe(
-                            self.websocket_manager.send_to_thread(payload, thread_id),
-                            manager_loop
-                        )
+                        # 跨线程：安全地提交到管理器所在的事件循环
+                        asyncio.run_coroutine_threadsafe(coro, manager_loop)
             except Exception as e:
-                print(f"[Monitor] WebSocket send failed: {e}")
+                logger.warning(f"[Monitor] WebSocket send failed: {e}")
 
         if builtins and hasattr(builtins, 'runtime') and hasattr(builtins.runtime, 'stream_writer'):
             try:
                 builtins.runtime.stream_writer(payload)
             except Exception as e:
-                print(f"[Monitor] Runtime stream writer failed: {e}")
+                logger.warning(f"[Monitor] Runtime stream writer failed: {e}")
 
-        # 3. 控制台保底输出 (方便调试)
-        # 加上特殊前缀，方便肉眼识别
-        print(f"\n[Monitor:{event_type}] {message}")
+        logger.info(f"[Monitor:{event_type}] {message}")
 
     def report_tool(self, tool_name: str, args: Dict[str, Any] = None):
         """报告工具开始执行"""
@@ -101,8 +105,12 @@ monitor = ToolMonitor()
 
 
 class ConnectionManager:
+    """
+    WebSocket 连接管理器。
+    支持同一 thread_id 的多个连接（如多标签页），向该会话所有连接广播消息。
+    """
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_connections: Dict[str, List[WebSocket]] = {}
         self.loop = None
 
     def set_loop(self, loop):
@@ -111,15 +119,30 @@ class ConnectionManager:
 
     async def connect(self, websocket: WebSocket, thread_id: str):
         await websocket.accept()
-        self.active_connections[thread_id] = websocket
+        self.active_connections.setdefault(thread_id, []).append(websocket)
 
     def disconnect(self, websocket: WebSocket, thread_id: str):
-        self.active_connections.pop(thread_id, None)
+        conns = self.active_connections.get(thread_id)
+        if conns:
+            try:
+                conns.remove(websocket)
+            except ValueError:
+                pass
+            if not conns:
+                self.active_connections.pop(thread_id, None)
 
     async def send_to_thread(self, message: dict, thread_id: str):
-        websocket = self.active_connections.get(thread_id)
-        if websocket:
-            await websocket.send_json(message)
+        """向同一 thread_id 的所有活跃连接广播消息"""
+        conns = self.active_connections.get(thread_id, [])
+        dead = []
+        for ws in conns:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        # 清理已失效的连接
+        for ws in dead:
+            self.disconnect(ws, thread_id)
 
 
 manager = ConnectionManager()

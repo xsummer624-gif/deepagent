@@ -1,7 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, computed } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, computed } from 'vue'
 import axios from 'axios'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+// API 配置常量（可按需通过环境变量覆盖）
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const WS_BASE = (import.meta.env.VITE_WS_BASE || 'ws://localhost:8000')
 
 // Types
 interface Message {
@@ -39,6 +44,13 @@ const fileList = ref<any[]>([])
 // 生成一个持久的会话ID，如果页面不刷新，ID不变
 const currentThreadId = ref(crypto.randomUUID())
 
+// WebSocket 重连控制
+let wsReconnectAttempts = 0
+const WS_MAX_RECONNECT = 10
+const WS_BASE_DELAY = 1000
+let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null
+let wsManuallyClosed = false
+
 // Helper: Scroll to bottom
 const scrollToBottom = async () => {
   await nextTick()
@@ -51,14 +63,13 @@ const scrollToBottom = async () => {
 const fetchFiles = async () => {
   if (!currentSessionPath.value) return
   try {
-    const res = await axios.get('http://localhost:8000/api/files', {
+    const res = await axios.get(`${API_BASE}/api/files`, {
       params: { path: currentSessionPath.value }
     })
     if (res.data.files) {
       fileList.value = res.data.files.map((f: any) => ({
         ...f,
-        // 使用新的下载 API，传入绝对路径
-        url: `http://localhost:8000/api/download?path=${encodeURIComponent(f.path)}`
+        url: `${API_BASE}${f.url}`
       }))
     }
   } catch (e) {
@@ -66,12 +77,14 @@ const fetchFiles = async () => {
   }
 }
 
-// WebSocket Connection
+// WebSocket Connection (指数退避重连)
 const connectWebSocket = () => {
-  const ws = new WebSocket(`ws://localhost:8000/ws/${currentThreadId.value}`)
+  if (wsManuallyClosed) return
+  const ws = new WebSocket(`${WS_BASE}/ws/${currentThreadId.value}`)
 
   ws.onopen = () => {
     console.log('WebSocket Connected')
+    wsReconnectAttempts = 0
   }
 
   ws.onmessage = (event) => {
@@ -84,8 +97,20 @@ const connectWebSocket = () => {
   }
 
   ws.onclose = () => {
-    console.log('WebSocket Disconnected, retrying in 3s...')
-    setTimeout(connectWebSocket, 3000)
+    console.log('WebSocket Disconnected')
+    if (wsManuallyClosed) return
+    if (wsReconnectAttempts < WS_MAX_RECONNECT) {
+      const delay = Math.min(WS_BASE_DELAY * 2 ** wsReconnectAttempts, 30000)
+      wsReconnectAttempts++
+      console.log(`Reconnecting in ${delay}ms (attempt ${wsReconnectAttempts}/${WS_MAX_RECONNECT})...`)
+      wsReconnectTimer = setTimeout(connectWebSocket, delay)
+    } else {
+      console.warn('Max WebSocket reconnect attempts reached, giving up.')
+    }
+  }
+
+  ws.onerror = () => {
+    ws.close()
   }
 
   socket.value = ws
@@ -98,21 +123,15 @@ const handleSocketMessage = (data: any) => {
   if (type === 'pong') return
 
   let lastAiMsg = messages.value.slice().reverse().find(m => m.role === 'ai')
-  
+
   if (event === 'session_created') {
+    // eventData.path 现在是相对 output 的路径（如 session_xxx）
     currentSessionPath.value = eventData.path
-    const parts = eventData.path.split(/output[\\/]/)
-    if (parts.length > 1) {
-      currentSessionUrl.value = `http://localhost:8000/outputs/${parts[1].replace(/\\/g, '/')}`
-    }
+    currentSessionUrl.value = `${API_BASE}/outputs/${eventData.path}`
     isSidebarOpen.value = true
     fetchFiles()
   } else if (event === 'tool_start') {
-    // 触发文件列表刷新，以确保用户能看到生成的文件
     if (currentSessionPath.value) {
-      // 延迟一点刷新，因为工具刚开始运行，文件可能还没生成
-      // 但如果是“写入文件”类工具，可能很快就有了
-      // 这里可以尝试立即刷新 + 延迟刷新
       fetchFiles()
       setTimeout(fetchFiles, 2000)
     }
@@ -125,13 +144,12 @@ const handleSocketMessage = (data: any) => {
         details: eventData.args,
         timestamp: new Date().toLocaleTimeString()
       })
-      
+
       if (eventData.args && eventData.args.filename && currentSessionUrl.value) {
         if (!lastAiMsg.files) lastAiMsg.files = []
         const fileUrl = `${currentSessionUrl.value}/${eventData.args.filename}`
-        // Avoid duplicates
         if (!lastAiMsg.files.find(f => f.name === eventData.args.filename)) {
-           lastAiMsg.files.push({
+          lastAiMsg.files.push({
             name: eventData.args.filename,
             path: eventData.args.filename,
             url: fileUrl
@@ -140,11 +158,10 @@ const handleSocketMessage = (data: any) => {
       }
     }
   } else if (event === 'assistant_call') {
-    // 同样刷新文件列表
     if (currentSessionPath.value) {
-        fetchFiles()
+      fetchFiles()
     }
-     if (lastAiMsg) {
+    if (lastAiMsg) {
       if (!lastAiMsg.logs) lastAiMsg.logs = []
       lastAiMsg.logs.push({
         type: 'agent',
@@ -157,7 +174,7 @@ const handleSocketMessage = (data: any) => {
     if (lastAiMsg) {
       lastAiMsg.content = eventData.result
     } else {
-       messages.value.push({
+      messages.value.push({
         role: 'ai',
         content: eventData.result,
         timestamp: Date.now()
@@ -166,14 +183,14 @@ const handleSocketMessage = (data: any) => {
     status.value = 'idle'
     fetchFiles()
   } else if (event === 'error') {
-     messages.value.push({
+    messages.value.push({
       role: 'system',
       content: `Error: ${message}`,
       timestamp: Date.now()
     })
     status.value = 'idle'
   }
-  
+
   scrollToBottom()
 }
 
@@ -193,7 +210,7 @@ const sendMessage = async () => {
 
   messages.value.push({
     role: 'ai',
-    content: '', // Start empty, show "Thinking" via logs/status if needed, or placeholder
+    content: '',
     logs: [],
     files: [],
     timestamp: Date.now()
@@ -204,79 +221,70 @@ const sendMessage = async () => {
   // Handle File Upload
   if (selectedFiles.value.length > 0) {
     console.log('Uploading files:', selectedFiles.value)
-    
-    // Log to UI
+
     const lastAiMsg = messages.value[messages.value.length - 1]
     if (lastAiMsg && lastAiMsg.role === 'ai') {
-        if (!lastAiMsg.logs) lastAiMsg.logs = []
-        
-        const fileDetails = selectedFiles.value.map(f => ({ name: f.name, size: f.size }))
-        
-        lastAiMsg.logs.push({
-            type: 'info',
-            title: `Uploading ${selectedFiles.value.length} file(s)...`,
-            details: fileDetails,
-            timestamp: new Date().toLocaleTimeString()
-        })
+      if (!lastAiMsg.logs) lastAiMsg.logs = []
+
+      const fileDetails = selectedFiles.value.map(f => ({ name: f.name, size: f.size }))
+
+      lastAiMsg.logs.push({
+        type: 'info',
+        title: `Uploading ${selectedFiles.value.length} file(s)...`,
+        details: fileDetails,
+        timestamp: new Date().toLocaleTimeString()
+      })
     }
 
-    // Actual Upload
     try {
-        const formData = new FormData()
-        // Ensure thread_id is available
-        if (typeof currentThreadId !== 'undefined' && currentThreadId.value) {
-             formData.append('thread_id', currentThreadId.value)
-        } else {
-             // Fallback if no thread ID (should ideally not happen as initialized in state)
-             console.warn('No thread ID found for upload')
-        }
+      const formData = new FormData()
+      if (currentThreadId.value) {
+        formData.append('thread_id', currentThreadId.value)
+      } else {
+        console.warn('No thread ID found for upload')
+      }
 
-        selectedFiles.value.forEach(file => {
-            console.log(`Appending file to FormData: name=${file.name}, size=${file.size}, type=${file.type}`)
-            formData.append('files', file)
-        })
+      selectedFiles.value.forEach(file => {
+        formData.append('files', file)
+      })
 
-        await axios.post('http://127.0.0.1:8000/api/upload', formData, {
-            headers: {
-                'Content-Type': 'multipart/form-data'
-            }
-        })
-        
-        // Clear files after successful upload
-        selectedFiles.value = []
-        
-        if (lastAiMsg && lastAiMsg.logs) {
-            lastAiMsg.logs.push({
-                type: 'success',
-                title: 'Files uploaded successfully',
-                details: null,
-                timestamp: new Date().toLocaleTimeString()
-            })
+      await axios.post(`${API_BASE}/api/upload`, formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
         }
+      })
+
+      selectedFiles.value = []
+
+      if (lastAiMsg && lastAiMsg.logs) {
+        lastAiMsg.logs.push({
+          type: 'success',
+          title: 'Files uploaded successfully',
+          details: null,
+          timestamp: new Date().toLocaleTimeString()
+        })
+      }
 
     } catch (e: any) {
-        console.error('Upload failed', e)
-        if (lastAiMsg && lastAiMsg.logs) {
-            lastAiMsg.logs.push({
-                type: 'error',
-                title: 'File upload failed',
-                details: e.message || 'Unknown error',
-                timestamp: new Date().toLocaleTimeString()
-            })
-        }
-        // Don't stop task execution, but maybe warn user?
+      console.error('Upload failed', e)
+      if (lastAiMsg && lastAiMsg.logs) {
+        lastAiMsg.logs.push({
+          type: 'error',
+          title: 'File upload failed',
+          details: e.message || 'Unknown error',
+          timestamp: new Date().toLocaleTimeString()
+        })
+      }
     }
   }
 
   try {
     const payload: any = { query }
-    // Only add thread_id if it exists and is not empty
-    if (typeof currentThreadId !== 'undefined' && currentThreadId.value) {
+    if (currentThreadId.value) {
       payload.thread_id = currentThreadId.value
     }
-    console.log('Sending request payload:', payload)
-    const res = await axios.post('http://127.0.0.1:8000/api/task', payload)
-    
+    const res = await axios.post(`${API_BASE}/api/task`, payload)
+
     if (res.data && res.data.thread_id) {
       currentThreadId.value = res.data.thread_id
     }
@@ -285,9 +293,9 @@ const sendMessage = async () => {
     let errorMsg = 'Failed to send request.'
     if (error.message) errorMsg += ` (${error.message})`
     if (error.response && error.response.data) {
-        errorMsg += ` Server says: ${JSON.stringify(error.response.data)}`
+      errorMsg += ` Server says: ${JSON.stringify(error.response.data)}`
     }
-    
+
     messages.value.push({
       role: 'system',
       content: errorMsg,
@@ -308,10 +316,7 @@ const triggerFileUpload = () => {
 const handleFileChange = (event: Event) => {
   const target = event.target as HTMLInputElement
   if (target.files && target.files.length > 0) {
-    // Append new files to existing list
     selectedFiles.value = [...selectedFiles.value, ...Array.from(target.files)]
-    console.log('Files selected:', selectedFiles.value)
-    // Reset input so same file can be selected again if needed
     target.value = ''
   }
 }
@@ -320,13 +325,20 @@ const removeFile = (index: number) => {
   selectedFiles.value.splice(index, 1)
 }
 
+// Markdown 渲染（经 DOMPurify 净化，防 XSS）
 const renderMarkdown = (text: string) => {
   if (!text) return '<span class="typing-indicator">Thinking...</span>'
-  return marked(text)
+  return DOMPurify.sanitize(marked(text) as string)
 }
 
 onMounted(() => {
   connectWebSocket()
+})
+
+onUnmounted(() => {
+  wsManuallyClosed = true
+  if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
+  if (socket.value) socket.value.close()
 })
 </script>
 

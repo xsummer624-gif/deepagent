@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from dotenv import load_dotenv
 from api.monitor import monitor
 from mysql.connector import connect, Error
@@ -7,6 +8,14 @@ from typing import Annotated, List
 from langchain_core.tools import tool
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# 危险关键字黑名单（用于拦截非 SELECT 类危险操作）
+_DANGEROUS_KEYWORDS = {
+    "INTO OUTFILE", "INTO DUMPFILE", "LOAD_FILE", "SYSTEM", "SLEEP",
+    "BENCHMARK", "INFORMATION_SCHEMA", "MYSQL.USER",
+}
 
 
 def get_db_config():
@@ -48,6 +57,42 @@ def _execute_query(sql: str, description: str = "") -> str:
                 return f"{','.join(columns)}\n{'\n'.join(results)}"
     except Error as e:
         return f"查询出现异常: {str(e)}"
+
+
+def _sanitize_select_query(query: str) -> str:
+    """
+    安全校验：仅允许单条只读 SELECT 查询。
+    - 去除前后空白与注释
+    - 必须以 SELECT 开头
+    - 禁止分号（堆叠查询）
+    - 禁止危险关键字
+    - 若无 LIMIT，自动追加 LIMIT 100 防止返回过大结果集
+    """
+    stripped = query.strip()
+    # 去除前导 /* */ 注释和 -- 注释
+    cleaned = re.sub(r'^/\*.*?\*/\s*', '', stripped, flags=re.DOTALL)
+    cleaned = re.sub(r'^--.*$', '', cleaned, flags=re.MULTILINE).strip()
+    if not cleaned:
+        raise ValueError("空查询或仅含注释")
+
+    upper = cleaned.upper()
+    if not upper.startswith("SELECT"):
+        raise ValueError(f"仅允许 SELECT 查询，当前语句以 '{cleaned.split()[0]}' 开头")
+
+    # 禁止分号（防止堆叠注入）
+    if ";" in cleaned:
+        raise ValueError("禁止使用分号（仅允许单条语句）")
+
+    # 危险关键字检查
+    for kw in _DANGEROUS_KEYWORDS:
+        if kw in upper:
+            raise ValueError(f"禁止使用危险关键字: {kw}")
+
+    # 自动追加 LIMIT
+    if "LIMIT" not in upper:
+        cleaned = f"{cleaned} LIMIT 100"
+
+    return cleaned
 
 
 @tool
@@ -99,24 +144,22 @@ def get_table_data(table_name: str) -> str:
 @tool
 def execute_sql_query(query: str) -> str:
     """
-    执行自定义查询语句。仅允许 SELECT 查询。
+    执行自定义查询语句。仅允许单条只读 SELECT 查询，禁止分号与文件写入操作。
     执行前需通过 list_sql_tables 明确表名，通过 get_table_data 明确表结构和数据格式。
     返回 CSV 格式数据，至多 100 条。
     """
     monitor.report_tool(tool_name="数据库表数据查询工具: execute_sql_query", args={"query": query})
 
-    stripped = query.strip().upper()
-    if not stripped.startswith("SELECT"):
-        return f"错误：仅允许 SELECT 查询，当前语句以 '{stripped.split()[0] if stripped else ''}' 开头"
+    try:
+        safe_sql = _sanitize_select_query(query)
+    except ValueError as e:
+        return f"错误：{e}"
 
-    if "INTO OUTFILE" in stripped or "INTO DUMPFILE" in stripped:
-        return "错误：禁止使用文件写入操作"
-
-    result = _execute_query(query)
+    result = _execute_query(safe_sql)
     if "查询出现异常" in result:
         return result
     lines = result.strip().split("\n")
     if len(lines) < 2:
-        return f"执行自定义查询SQL语句查询没有结果，sql为: {query}"
+        return f"执行自定义查询SQL语句查询没有结果，sql为: {safe_sql}"
     return result
 

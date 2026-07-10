@@ -1,10 +1,13 @@
 import sys
 import uuid
 import asyncio
+import logging
 import uvicorn
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict
@@ -17,24 +20,31 @@ if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 # Import agent runner and monitor
-# 注意：agent.main_agent 导入时会初始化 main_agent，这可能需要几秒钟
 from agent.main_agent import run_deep_agent
 from api.monitor import monitor, manager
 
-app = FastAPI(title="DeepAgents API")
+logger = logging.getLogger(__name__)
 
 # 跟踪运行中的任务，用于取消和状态查询
 _running_tasks: Dict[str, asyncio.Task] = {}
 
 # 挂载输出目录，以便前端访问生成的静态文件
-# 假设输出目录位于项目根目录下的 output
 output_dir = project_root / "output"
 output_dir.mkdir(exist_ok=True)
-# app.mount("/outputs", StaticFiles(directory=str(output_dir)), name="outputs")
 
 # 定义上传目录 updated
 updated_dir = project_root / "updated"
 updated_dir.mkdir(exist_ok=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动：绑定事件循环到 WebSocket 管理器
+    manager.set_loop(asyncio.get_running_loop())
+    yield
+
+
+app = FastAPI(title="DeepAgents API", lifespan=lifespan)
 
 # 配置 CORS
 app.add_middleware(
@@ -45,9 +55,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    manager.set_loop(asyncio.get_running_loop())
+# 挂载 output 目录为静态文件，前端可通过 /outputs/ 直接访问生成的文件
+app.mount("/outputs", StaticFiles(directory=str(output_dir)), name="outputs")
 
 
 class TaskRequest(BaseModel):
@@ -58,201 +67,127 @@ class TaskRequest(BaseModel):
 @app.post("/api/task")
 async def run_task(request: TaskRequest):
     """
-    智能体任务启动接口 (Run Agent Task)。
-
-    目标：
-    1. 接收用户的自然语言指令。
-    2. 在后台异步启动 Agent 执行逻辑。
-    3. 返回会话 ID，供前端通过 WebSocket 订阅实时进度。
-
-    执行步骤：
-    1. 获取或生成 thread_id。
-    2. 触发异步任务 (asyncio.create_task)。
-    3. 立即返回响应，不阻塞 HTTP 线程。
-
-    Args:
-        request (TaskRequest): 包含用户 query 和可选 thread_id 的请求体。
+    智能体任务启动接口。
+    接收用户自然语言指令，后台异步启动 Agent，立即返回会话 ID。
     """
-    # 1. [ID 初始化]
     thread_id = request.thread_id or str(uuid.uuid4())
 
-    # 2. [后台执行] 异步运行 Agent，不阻塞主线程
+    # 校验：同一会话不允许重复派发正在运行的任务
+    existing = _running_tasks.get(thread_id)
+    if existing and not existing.done():
+        raise HTTPException(status_code=409, detail=f"会话 {thread_id} 已有任务正在运行")
+
     task = asyncio.create_task(run_deep_agent(request.query, thread_id))
     _running_tasks[thread_id] = task
-
-    # 任务完成后自动清理
     task.add_done_callback(lambda t: _running_tasks.pop(thread_id, None))
 
-    # 3. [立即响应]
     return {"status": "started", "thread_id": thread_id}
 
 
 @app.post("/api/upload")
 async def upload_files(files: List[UploadFile] = File(...), thread_id: str = Form(...)):
     """
-    文件上传接口 (File Upload)。
-
-    目标：
-    1. 接收用户上传的一个或多个文件。
-    2. 保存到 `updated/session_{thread_id}` 目录。
-    3. 供 Agent 在后续任务中读取和分析。
-
-    Args:
-        files (List[UploadFile]): 文件对象列表。
-        thread_id (str): 关联的任务会话 ID。
+    文件上传接口。
+    保存到 updated/session_{thread_id} 目录，供 Agent 后续读取。
     """
-    # 1. [目录准备] 确保上传目录存在
     target_dir = updated_dir / f"session_{thread_id}"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = []
-    # 2. [保存] 遍历并写入文件
     for file in files:
-        file_path = target_dir / file.filename
-        # 使用二进制模式写入，支持各种文件格式 (图片、PDF、文本等)
-        # shutil.copyfileobj 高效复制文件流，避免一次性加载大文件到内存
+        # 防止路径遍历：仅取文件名
+        safe_name = Path(file.filename).name
+        file_path = target_dir / safe_name
         with file_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        saved_files.append(file.filename)
+        saved_files.append(safe_name)
 
-    # 3. [响应] 返回成功保存的文件列表
     return {"status": "uploaded", "files": saved_files}
+
+
+def _resolve_safe_path(rel_path: str) -> Path:
+    """将相对路径解析到 output_dir 内，拒绝越界访问。返回绝对 Path。"""
+    if not rel_path:
+        raise HTTPException(status_code=400, detail="路径不能为空")
+    # 阻止绝对路径和路径遍历
+    abs_path = (output_dir / rel_path).resolve()
+    output_abs = output_dir.resolve()
+    if not abs_path.is_relative_to(output_abs):
+        raise HTTPException(status_code=403, detail="拒绝访问: 只能访问输出目录下的文件")
+    return abs_path
 
 
 @app.get("/api/download")
 async def download_file(path: str):
     """
-    文件下载接口 (File Download)。
-
-    目标：
-    1. 根据绝对路径下载文件。
-    2. 严格的安全检查，防止越权访问。
-
-    Args:
-        path (str): 文件的绝对路径 (通常从 list_files 接口获取)。
+    文件下载接口。
+    接受相对 output 目录的路径，返回文件流。
     """
-    # 1. [安全检查] 路径解析与越权校验
-    try:
-        abs_path = Path(path).resolve()
-        output_abs = output_dir.resolve()
-
-        # 必须确保请求的文件在 output 目录下
-        if not abs_path.is_relative_to(output_abs):
-            return {"error": "拒绝访问: 只能下载输出目录下的文件"}
-    except Exception:
-        return {"error": "无效的路径参数"}
-    # 2. [存在性检查]
+    abs_path = _resolve_safe_path(path)
     if not abs_path.exists():
-        return {"error": "文件不存在"}
-
-    # 3. [响应] 返回文件流 (浏览器自动触发下载)
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if not abs_path.is_file():
+        raise HTTPException(status_code=400, detail="路径不是文件")
     return FileResponse(abs_path, filename=abs_path.name)
 
 
 @app.get("/api/files")
 async def list_files(path: str):
     """
-    文件列表查询接口 (File Explorer)。
-
-    目标：
-    1. 列出指定目录下的所有生成文件。
-    2. 提供文件元数据（大小、时间、下载链接）。
-    3. 严格的安全检查，防止路径遍历攻击。
-
-    Args:
-        path (str): 目标目录的绝对路径 (必须在 output 目录下)。
+    文件列表查询接口。
+    接受相对 output 目录的路径，列出其下所有文件（含元数据）。
     """
-    # 1. [调试] 打印请求路径
-    print(f"[DEBUG] 请求文件列表: {path}")
-
-    try:
-        # 2. [解析] 获取绝对路径对象
-        abs_path = Path(path).resolve()
-        output_abs = output_dir.resolve()
-
-        # 3. [安全] 检查路径是否越界 (Path Traversal Check)
-        if not abs_path.is_relative_to(output_abs):
-            print(f"[ERROR] 拒绝访问: {abs_path} 不在 {output_abs} 目录下")
-            return {"error": "拒绝访问: 只能访问输出目录下的文件"}
-
-    except Exception as e:
-        print(f"[ERROR] 路径解析失败: {e}")
-        return {"error": f"路径无效: {e}"}
-
-    # 4. [检查] 目录是否存在
+    abs_path = _resolve_safe_path(path)
     if not abs_path.exists():
-        return {"error": "目录不存在"}
+        raise HTTPException(status_code=404, detail="目录不存在")
 
     files = []
     try:
-        # 5. [遍历] 递归查找所有文件
         for file_path in abs_path.rglob("*"):
             if file_path.is_file():
-                # 计算相对路径，生成下载 URL
                 stat = file_path.stat()
+                rel = file_path.relative_to(output_dir.resolve()).as_posix()
                 files.append({
                     "name": file_path.name,
                     "type": "file",
-                    "path": str(file_path),
-                    # "url": f"/outputs/{url_path}",
+                    "path": rel,
+                    "url": f"/api/download?path={rel}",
                     "size": stat.st_size,
                     "mtime": stat.st_mtime
                 })
-
     except Exception as e:
-        print(f"[ERROR] 遍历文件失败: {e}")
-        return {"error": str(e)}
+        logger.exception("遍历文件失败")
+        raise HTTPException(status_code=500, detail=f"遍历文件失败: {e}")
 
-    # 6. [排序] 按修改时间倒序排列 (最新的在前)
     files.sort(key=lambda x: x.get("mtime", 0), reverse=True)
-    print(f"[DEBUG] 找到 {len(files)} 个文件")
     return {"files": files}
 
 
 @app.websocket("/ws/{thread_id}")
 async def websocket_endpoint(websocket: WebSocket, thread_id: str):
     """
-    WebSocket 实时通讯核心接口 (Real-time Communication)。
-
-    目标：
-    1. 建立长连接，实现服务端与前端的双向通信。
-    2. 绑定 `thread_id`，实现会话级消息隔离。
-    3. 维持心跳 (Keep-Alive)，防止连接超时。
-
-    执行步骤：
-    1. 握手：接受 WebSocket 连接请求。
-    2. 注册：将连接实例绑定到 `monitor.manager`，关联 `thread_id`。
-    3. 循环：进入消息监听循环，处理前端发送的心跳或指令。
-    4. 异常：捕获断开连接异常，清理资源。
-
-    Args:
-        websocket (WebSocket): WebSocket 连接实例。
-        thread_id (str): 当前会话的唯一标识。
+    WebSocket 实时通讯核心接口。
+    绑定 thread_id 实现会话级消息隔离，维持心跳。
     """
-    # 1. [注册] 建立连接并绑定到管理器
     await manager.connect(websocket, thread_id)
 
     try:
-        # 2. [循环] 保持连接活跃
         while True:
-            # 3. [监听] 接收前端消息 (通常是 ping 心跳)
             data = await websocket.receive_text()
-
-            # 4. [响应] 回复 pong 消息
             await websocket.send_json({
                 "type": "pong",
                 "message": f"服务端已收到: {data}"
             })
 
     except WebSocketDisconnect:
-        # 5. [清理] 客户端主动断开
         manager.disconnect(websocket, thread_id)
-        print(f"[WebSocket] 客户端已断开: {thread_id}")
+        logger.info(f"[WebSocket] 客户端已断开: {thread_id}")
 
     except Exception as e:
-        # 6. [异常] 发生错误时断开
-        print(f"[WebSocket] 连接异常: {e}")
+        logger.exception(f"[WebSocket] 连接异常: {thread_id}")
         manager.disconnect(websocket, thread_id)
 
+
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     uvicorn.run("api.server:app", host="0.0.0.0", port=8000, reload=True)
